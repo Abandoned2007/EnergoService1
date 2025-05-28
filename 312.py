@@ -98,6 +98,17 @@ def load_jobs_context():
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             jobs_context.update(json.load(f))
 
+def remove_expired_jobs():
+    now = datetime.now()
+    expired_keys = [
+        key for key, job in jobs_context.items()
+        if datetime.strptime(job['deadline'], "%d.%m.%Y %H:%M") < now
+    ]
+    for key in expired_keys:
+        jobs_context.pop(key)
+    if expired_keys:
+        save_jobs_context()
+
 async def restore_deadlines(app):
     now = datetime.now()
     for job_key, info in jobs_context.items():
@@ -275,6 +286,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     load_jobs_context()
     load_jobs_applications()
+    remove_expired_jobs()
 
     application = ApplicationBuilder().token(TOKEN).post_init(restore_deadlines).build()
 
@@ -290,7 +302,7 @@ def main():
     )
 
     application.add_handler(conv)
-    application.add_handler(CommandHandler("post", post))   # Обязательно! иначе нет доступа к команде /post
+    application.add_handler(CommandHandler("post", post))
 
     application.run_polling()
 
