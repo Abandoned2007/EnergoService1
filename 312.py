@@ -10,12 +10,17 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler, ContextTypes
 )
 from oauth2client.service_account import ServiceAccountCredentials
+import json
+import os
 
 # === НАСТРОЙКИ ===
 TOKEN = "8109187093:AAE3YTLbFlz3x-nq-J5kM_M-iMXmmwPNfF8"
 ADMIN_IDS = {1333437457}  # Ваш Telegram ID
+deadline_tasks = {}
 bot_username = "EnergoServiceBot"   # Имя вашего бота
 CSV_FILE = "applications.csv"
+JOBS_FILE = 'jobs.json'
+JOBS_APPLICATIONS_FILE = 'jobs_applications.json'
 
 GOOGLE_CREDS_FILE = "cultivated-age-438106-i2-39cf553124d7.json"
 GOOGLE_SHEET_ID = "1ZJkQJjlPZELzTnjCqQhF5IDMmUWF-nG-yO2kzbK0G70"  # Только ID!
@@ -40,6 +45,16 @@ def get_worksheet():
     creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_FILE, SCOPE)
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+def save_jobs_applications():
+    with open(JOBS_APPLICATIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(jobs_applications, f, ensure_ascii=False, indent=2)
+
+def load_jobs_applications():
+    global jobs_applications
+    if os.path.exists(JOBS_APPLICATIONS_FILE):
+        with open(JOBS_APPLICATIONS_FILE, 'r', encoding='utf-8') as f:
+            jobs_applications.update(json.load(f))
 
 async def save_application(job_key, data, choice, reason):
     row = [
@@ -66,7 +81,37 @@ async def save_application(job_key, data, choice, reason):
         "choice": choice,
         "reason": reason
     })
+    jobs_applications.setdefault(job_key, []).append({
+        "fio": data.get("fio", ""),
+        "choice": choice,
+        "reason": reason
+    })
+    save_jobs_applications()
 
+def save_jobs_context():
+    with open(JOBS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(jobs_context, f, ensure_ascii=False, indent=2)
+
+def load_jobs_context():
+    global jobs_context
+    if os.path.exists(JOBS_FILE):
+        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            jobs_context.update(json.load(f))
+
+async def restore_deadlines(app):
+    now = datetime.now()
+    for job_key, info in jobs_context.items():
+        try:
+            deadline = datetime.strptime(info['deadline'], "%d.%m.%Y %H:%M")
+            chat_id = info.get("chat_id")
+            message_id = info.get("message_id")
+            if deadline > now:
+                delay = (deadline - now).total_seconds()
+                app.create_task(delayed_notification(app, job_key, delay, chat_id, message_id))
+            else:
+                app.create_task(delayed_notification(app, job_key, 0, chat_id, message_id))
+        except Exception as e:
+            print(f"Failed to restore deadline for job {job_key}: {e}")
 
 async def notify_admins_about_job(context, job_key):
     job = jobs_context.get(job_key)
@@ -113,12 +158,6 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
 
     job_key = str(uuid4())[:8]
-    jobs_context[job_key] = {
-        "work_title": work_title,
-        "city": city,
-        "description": description,
-        "deadline": deadline.strftime("%d.%m.%Y %H:%M")
-    }
     link = f"https://t.me/{bot_username}?start=apply_{job_key}"
     msg = (
         f"Работы: {work_title}\n"
@@ -129,7 +168,7 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     keyboard = [[InlineKeyboardButton("Записаться на работы", url=link)]]
 
-    # Отправляем пост НЕ в режиме ответа:
+    # Сперва отправляем пост
     sent_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=msg,
@@ -137,6 +176,17 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'  # если нужно форматирование
     )
     post_message_id = sent_msg.message_id
+
+    # Теперь сохраняем вакансию с message_id
+    jobs_context[job_key] = {
+        "work_title": work_title,
+        "city": city,
+        "description": description,
+        "deadline": deadline.strftime("%d.%m.%Y %H:%M"),
+        "chat_id": chat_id,
+        "message_id": post_message_id
+    }
+    save_jobs_context()
 
     try:
         await update.message.delete()
@@ -148,14 +198,13 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delayed_notification(context, job_key, delay, chat_id, post_message_id)
     )
 
-async def delayed_notification(context, job_key, delay, chat_id, message_id):
+async def delayed_notification(context, job_key, delay, chat_id=None, message_id=None):
     await asyncio.sleep(delay)
-    try:
-        # Убираем кнопку/markup по истечении времени
-        await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
-        # НЕ отправляем никакое новое сообщение в чат!
-    except Exception as e:
-        logger.warning(f"Edit post error: {e}")
+    if chat_id and message_id:
+        try:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+        except Exception as e:
+            logger.warning(f"Edit post error: {e}")
     await notify_admins_about_job(context, job_key)
 
 # ====== /start ======
@@ -224,7 +273,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    load_jobs_context()
+    load_jobs_applications()
+
+    application = ApplicationBuilder().token(TOKEN).post_init(restore_deadlines).build()
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -235,10 +288,11 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True
     )
-    app.add_handler(CommandHandler("post", post))
-    app.add_handler(conv)
-    logger.info("Bot started")
-    app.run_polling()
+
+    application.add_handler(conv)
+    application.add_handler(CommandHandler("post", post))   # Обязательно! иначе нет доступа к команде /post
+
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
